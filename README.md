@@ -92,6 +92,28 @@ Warnings:
 - `--restore` replaces the current contents of those live resource directories.
 - `--copy-config` overwrites `~/.pi/agent/settings.json` and `~/.pi/agent/mcp.json`.
 
+## Use your own GitHub repo
+
+`pi-setup-sync` does not hardcode a GitHub URL. It commits in the checkout it is installed from and runs `git push`, so it uses that checkout's configured git remote.
+
+For your own backup, fork or create your own repo first, then clone that repo:
+
+```bash
+git clone git@github.com:<user>/<repo>.git ~/dev/ai-agents/pi-setup
+cd ~/dev/ai-agents/pi-setup
+./install.sh --restore --copy-config
+```
+
+If you cloned this repo first and want future syncs to push to your own GitHub repo, change `origin`:
+
+```bash
+git remote -v
+git remote set-url origin git@github.com:<user>/<repo>.git
+git remote -v
+```
+
+Then `pi-setup-sync` will back up your live `~/.pi/agent` changes to that remote.
+
 ## Install helper commands only
 
 On a machine that already has the live files in `~/.pi/agent`, run:
