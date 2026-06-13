@@ -35,5 +35,12 @@ fi
 
 "$ROOT/setup_sync.sh"
 
+if [[ -f "$ROOT/bin/pi" ]]; then
+  mkdir -p "$HOME/.local/bin"
+  cp "$ROOT/bin/pi" "$HOME/.local/bin/pi"
+  chmod +x "$HOME/.local/bin/pi"
+  echo "Installed compact Pi launcher: $HOME/.local/bin/pi"
+fi
+
 echo "Done. Restart Pi or run /reload in an existing session."
 echo "Sync future tweaks with: pi-setup-sync"

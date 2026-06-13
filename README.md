@@ -4,8 +4,11 @@ Personal reproducible setup for [Pi coding agent](https://pi.dev): extensions, c
 
 ## What's included
 
+- `bin/pi` — compact Pi launcher wrapper
+  - logo before Pi's native header
+  - one-line update notices instead of large startup boxes
+  - preserves Pi's native loaded skills/extensions/themes listing
 - `extensions/` — custom Pi extensions
-  - startup welcome card
   - custom footer
   - context command
   - local model manager
@@ -96,7 +99,7 @@ Then use it from anywhere:
 pi-setup-sync
 ```
 
-`./install.sh` also runs `./setup_sync.sh` automatically.
+`./install.sh` also runs `./setup_sync.sh` automatically and installs the compact `pi` launcher to `~/.local/bin/pi`.
 
 Custom commit message:
 

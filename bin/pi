@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Personal Pi launcher.
+# - Prints the logo before Pi's native startup header/resource listing.
+# - Replaces Pi's large startup update boxes with one compact preflight line.
+
+REAL_PI="${PI_REAL_BIN:-/usr/bin/pi}"
+
+print_logo() {
+  cat <<'EOF'
+
+ ██████   ██
+ ██   ██  ██
+ ██████   ██
+ ██       ██
+ ██       ██
+ ██       ██
+EOF
+}
+
+version_gt() {
+  python3 - "$1" "$2" <<'PY' 2>/dev/null
+import re, sys
+
+def parts(v):
+    return [int(x or 0) for x in re.split(r'[^0-9]+', v.lstrip('v')) if x != '']
+a, b = parts(sys.argv[1]), parts(sys.argv[2])
+n = max(len(a), len(b))
+a += [0] * (n - len(a))
+b += [0] * (n - len(b))
+sys.exit(0 if a > b else 1)
+PY
+}
+
+current_pi_version() {
+  "$REAL_PI" --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
+}
+
+latest_pi_version() {
+  command -v curl >/dev/null 2>&1 || return 0
+  curl -fsSL --max-time 1.5 https://pi.dev/api/latest-version 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version", ""))' 2>/dev/null || true
+}
+
+package_updates() {
+  command -v node >/dev/null 2>&1 || return 0
+  node <<'JS' 2>/dev/null || true
+const fs = require('fs');
+const path = require('path');
+const { execFile } = require('child_process');
+const home = process.env.HOME || '';
+const piHome = process.env.PI_HOME || path.join(home, '.pi', 'agent');
+let settings = {};
+try { settings = JSON.parse(fs.readFileSync(path.join(piHome, 'settings.json'), 'utf8')); } catch {}
+const specs = (settings.packages || []).filter(s => typeof s === 'string' && s.startsWith('npm:'));
+function packageName(spec) {
+  const raw = spec.slice(4);
+  if (raw.startsWith('@')) return raw.split('@').slice(0, 2).join('@');
+  return raw.split('@')[0];
+}
+function installedVersion(pkg) {
+  try { return JSON.parse(fs.readFileSync(path.join(piHome, 'npm', 'node_modules', pkg, 'package.json'), 'utf8')).version; }
+  catch { return undefined; }
+}
+function cmp(a, b) {
+  const pa = String(a).split(/[^0-9]+/).filter(Boolean).map(Number);
+  const pb = String(b).split(/[^0-9]+/).filter(Boolean).map(Number);
+  const n = Math.max(pa.length, pb.length);
+  for (let i = 0; i < n; i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d;
+  }
+  return 0;
+}
+function latest(pkg) {
+  return new Promise(resolve => {
+    execFile('npm', ['view', pkg, 'version', '--silent'], { timeout: 1500 }, (err, stdout) => {
+      resolve(err ? undefined : stdout.trim());
+    });
+  });
+}
+(async () => {
+  const updates = [];
+  await Promise.all(specs.map(async spec => {
+    const pkg = packageName(spec);
+    const have = installedVersion(pkg);
+    const want = await latest(pkg);
+    if (have && want && cmp(want, have) > 0) updates.push(pkg);
+  }));
+  console.log(updates.sort().join(','));
+})();
+JS
+}
+
+compact_update_notice() {
+  [[ "${PI_COMPACT_UPDATE_CHECK:-1}" == "1" ]] || return 0
+  [[ "${PI_OFFLINE:-0}" == "1" ]] && return 0
+
+  local current latest packages parts=()
+  current="$(current_pi_version)"
+  latest="$(latest_pi_version)"
+  if [[ -n "$current" && -n "$latest" ]] && version_gt "$latest" "$current"; then
+    parts+=("pi $current → $latest")
+  fi
+
+  packages="$(package_updates)"
+  if [[ -n "$packages" ]]; then
+    parts+=("packages ${packages//,/, }")
+  fi
+
+  if [[ "${#parts[@]}" -gt 0 ]]; then
+    local joined="${parts[0]}" i
+    for ((i=1; i<${#parts[@]}; i++)); do
+      joined="$joined; ${parts[$i]}"
+    done
+    printf ' updates: %s · run pi update\n' "$joined"
+  fi
+}
+
+case "${1:-}" in
+  help)
+    CONTEXT_MODE_BRIDGE_DEPTH=1 PI_DISABLE_HOOKS=1 exec "$REAL_PI" --help
+    ;;
+  list|install|remove|update|config|--help|-h|--version|-v)
+    CONTEXT_MODE_BRIDGE_DEPTH=1 PI_DISABLE_HOOKS=1 exec "$REAL_PI" "$@"
+    ;;
+  *)
+    if [[ -t 1 ]]; then
+      print_logo
+      compact_update_notice
+    fi
+    # Suppress Pi's large built-in update boxes; the compact line above replaces them.
+    PI_OFFLINE=1 exec "$REAL_PI" "$@"
+    ;;
+esac
