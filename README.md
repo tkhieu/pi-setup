@@ -19,6 +19,7 @@ Personal reproducible setup for [Pi coding agent](https://pi.dev): extensions, c
   - `gruvbox`
   - `rose-pine`
   - `synthwave-84`
+- `skills/` — selected local Pi/Agent skills backed up as portable copies
 - `config/` — safe example config files
 
 ## Install from GitHub
@@ -109,7 +110,17 @@ Commit without pushing:
 pi-setup-sync --no-push "Checkpoint local Pi setup"
 ```
 
-The sync command copies current `~/.pi/agent/extensions`, `~/.pi/agent/themes`, `settings.json`, and `mcp.json` into this repo, validates JSON/theme tokens, commits, and pushes.
+The sync command copies current `~/.pi/agent/extensions`, `~/.pi/agent/themes`, selected skills, `settings.json`, and `mcp.json` into this repo, validates JSON/theme tokens, commits, and pushes.
+
+Skill backup scans `~/.pi/agent/skills` and `~/.agents/skills`, resolves symlinks, dedupes duplicates, and stores portable copies in `skills/`. All skills are selected by default; press Enter at the selector to accept all in one keystroke. To customize, use ↑/↓ to move, Space to toggle, `a` for all, `n` for none, and Enter to continue.
+
+Non-interactive options:
+
+```bash
+pi-setup-sync --all-skills
+pi-setup-sync --skills hf-cli,diagnose "Back up selected skills"
+pi-setup-sync --no-skills "Skip skill backup"
+```
 
 ## Applying updates on another machine
 

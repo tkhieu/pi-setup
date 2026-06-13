@@ -80,10 +80,17 @@ export default function (pi: ExtensionAPI) {
 		// Ensure any older fixed header from a previous version is removed.
 		ctx.ui.setHeader(undefined);
 
-		const isBrandNewSession = (event.reason === "startup" || event.reason === "new")
-			&& ctx.sessionManager.getBranch().length === 0;
+		const branch = ctx.sessionManager.getBranch();
+		const hasConversation = branch.some((entry: any) =>
+			entry.type === "message" || entry.type === "toolResult"
+		);
+		const hasWelcome = branch.some((entry: any) =>
+			entry.type === "custom_message" && entry.customType === "pi-welcome"
+		);
+		const isBrandNewSession = event.reason === "new"
+			|| (event.reason === "startup" && !hasConversation && !hasWelcome);
 		showWelcome = isBrandNewSession;
-		if (!isBrandNewSession) return;
+		if (!isBrandNewSession || hasWelcome) return;
 
 		pi.sendMessage({
 			customType: "pi-welcome",
