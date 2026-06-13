@@ -7,7 +7,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, matchesKey, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 type AnyRecord = Record<string, any>;
 
@@ -151,12 +151,13 @@ function buildReport(pi: ExtensionAPI, ctx: any): ContextReport {
 		.filter((tool: AnyRecord) => selected.size === 0 || selected.has(tool.name))
 		.map((tool: AnyRecord) => ({
 			label: tool.name,
-			tokens: estimateTokens({
-				name: tool.name,
-				description: tool.description,
-				parameters: tool.parameters,
-				promptGuidelines: tool.promptGuidelines,
-			}),
+			// Match the prompt-facing footprint, not the full JSON schema object. Full
+			// schemas badly overestimate startup usage compared with Pi's footer.
+			tokens: estimateTokens([
+				tool.name,
+				tool.description,
+				...(Array.isArray(tool.promptGuidelines) ? tool.promptGuidelines : []),
+			].filter(Boolean).join("\n")),
 			detail: tool.sourceInfo?.source ?? "tool",
 		}));
 
@@ -331,19 +332,26 @@ function renderReport(report: ContextReport, theme: any, width: number): string[
 	return lines.map((line) => visibleWidth(line) > width ? truncateToWidth(line, width) : line);
 }
 
-export default function (pi: ExtensionAPI) {
-	pi.registerMessageRenderer("context-usage", (message, _state, theme) => {
-		const report = message.details as ContextReport;
-		return {
-			render(width: number): string[] {
-				const box = new Box(1, 1, (s) => theme.bg("customMessageBg", s));
-				box.addChild(new Text(renderReport(report, theme, Math.max(20, width - 2)).join("\n"), 0, 0));
-				return box.render(width);
-			},
-			invalidate() {},
-		};
-	});
+async function showContextOverlay(report: ContextReport, ctx: any) {
+	await ctx.ui.custom((_tui: any, theme: any, _kb: any, done: (value?: unknown) => void) => ({
+		render(width: number): string[] {
+			const box = new Box(1, 1, (s) => theme.bg("customMessageBg", s));
+			const body = [
+				...renderReport(report, theme, Math.max(20, width - 2)),
+				"",
+				theme.fg("dim", "Enter/Esc to close · overlay only, not added to model context"),
+			].join("\n");
+			box.addChild(new Text(body, 0, 0));
+			return box.render(width);
+		},
+		invalidate() {},
+		handleInput(data: string) {
+			if (matchesKey(data, "enter") || matchesKey(data, "escape") || data === "q") done(undefined);
+		},
+	}), { overlay: true });
+}
 
+export default function (pi: ExtensionAPI) {
 	pi.registerCommand("context", {
 		description: "Show what is consuming the context window",
 		handler: async (_args, ctx) => {
@@ -352,12 +360,7 @@ export default function (pi: ExtensionAPI) {
 				console.log(plainReport(report));
 				return;
 			}
-			pi.sendMessage({
-				customType: "context-usage",
-				content: "context usage",
-				display: true,
-				details: report,
-			});
+			await showContextOverlay(report, ctx);
 		},
 	});
 }
