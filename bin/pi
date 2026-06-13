@@ -7,17 +7,28 @@ set -euo pipefail
 
 REAL_PI="${PI_REAL_BIN:-/usr/bin/pi}"
 
-version_gt() {
+major_minor_gt() {
   python3 - "$1" "$2" <<'PY' 2>/dev/null
 import re, sys
 
-def parts(v):
-    return [int(x or 0) for x in re.split(r'[^0-9]+', v.lstrip('v')) if x != '']
-a, b = parts(sys.argv[1]), parts(sys.argv[2])
-n = max(len(a), len(b))
-a += [0] * (n - len(a))
-b += [0] * (n - len(b))
-sys.exit(0 if a > b else 1)
+def major_minor(v):
+    parts = [int(x or 0) for x in re.split(r'[^0-9]+', v.lstrip('v')) if x != '']
+    return (parts + [0, 0])[:2]
+sys.exit(0 if major_minor(sys.argv[1]) > major_minor(sys.argv[2]) else 1)
+PY
+}
+
+welcome_updates_enabled() {
+  [[ "${PI_COMPACT_UPDATE_CHECK:-1}" == "1" ]] || return 1
+  python3 - <<'PY' 2>/dev/null
+import json, os, pathlib, sys
+pi_home = pathlib.Path(os.environ.get('PI_HOME') or pathlib.Path.home() / '.pi' / 'agent')
+config = pi_home / 'welcome.json'
+try:
+    data = json.loads(config.read_text())
+except Exception:
+    data = {}
+sys.exit(0 if data.get('updates', True) is not False else 1)
 PY
 }
 
@@ -51,11 +62,10 @@ function installedVersion(pkg) {
   try { return JSON.parse(fs.readFileSync(path.join(piHome, 'npm', 'node_modules', pkg, 'package.json'), 'utf8')).version; }
   catch { return undefined; }
 }
-function cmp(a, b) {
+function majorMinorCmp(a, b) {
   const pa = String(a).split(/[^0-9]+/).filter(Boolean).map(Number);
   const pb = String(b).split(/[^0-9]+/).filter(Boolean).map(Number);
-  const n = Math.max(pa.length, pb.length);
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < 2; i++) {
     const d = (pa[i] || 0) - (pb[i] || 0);
     if (d) return d;
   }
@@ -74,7 +84,7 @@ function latest(pkg) {
     const pkg = packageName(spec);
     const have = installedVersion(pkg);
     const want = await latest(pkg);
-    if (have && want && cmp(want, have) > 0) updates.push(pkg);
+    if (have && want && majorMinorCmp(want, have) > 0) updates.push(pkg);
   }));
   console.log(updates.sort().join(','));
 })();
@@ -82,13 +92,13 @@ JS
 }
 
 compact_update_notice() {
-  [[ "${PI_COMPACT_UPDATE_CHECK:-1}" == "1" ]] || return 0
+  welcome_updates_enabled || return 0
   [[ "${PI_OFFLINE:-0}" == "1" ]] && return 0
 
   local current latest packages parts=()
   current="$(current_pi_version)"
   latest="$(latest_pi_version)"
-  if [[ -n "$current" && -n "$latest" ]] && version_gt "$latest" "$current"; then
+  if [[ -n "$current" && -n "$latest" ]] && major_minor_gt "$latest" "$current"; then
     parts+=("pi $current → $latest")
   fi
 

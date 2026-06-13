@@ -5,7 +5,7 @@ Personal reproducible setup for [Pi coding agent](https://pi.dev): extensions, c
 ## What's included
 
 - `bin/pi` — compact Pi launcher wrapper
-  - one-line update notices instead of large startup boxes
+  - one-line major/minor update notices instead of large startup boxes
   - preserves Pi's native themed header and loaded skills/extensions/themes listing
 - `extensions/` — custom Pi extensions
   - themed startup welcome card
@@ -100,6 +100,13 @@ pi-setup-sync
 ```
 
 `./install.sh` also runs `./setup_sync.sh` automatically and installs the compact `pi` launcher to `~/.local/bin/pi`.
+
+Welcome update notices only appear for major/minor updates, not patches. Toggle them with:
+
+```txt
+/welcome updates on
+/welcome updates off
+```
 
 Custom commit message:
 
