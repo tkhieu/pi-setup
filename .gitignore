@@ -19,6 +19,9 @@ local-models.json
 *.bak
 themes.backup-*/
 
+# Serena AI tool state
+.serena/
+
 # Node / editor noise
 node_modules/
 .DS_Store

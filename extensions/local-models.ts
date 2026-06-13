@@ -30,8 +30,22 @@ interface LocalEndpoint {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function generateId(): string {
-	return Math.random().toString(36).slice(2, 10);
+function normalizeBaseUrl(url: string): string {
+	return url.trim().replace(/\/+$/, "");
+}
+
+function generateEndpointId(baseUrl: string): string {
+	return crypto.createHash("sha256").update(normalizeBaseUrl(baseUrl)).digest("hex").slice(0, 10);
+}
+
+function generateUniqueEndpointId(baseUrl: string): string {
+	const baseId = generateEndpointId(baseUrl);
+	let id = baseId;
+	let suffix = 2;
+	while (endpoints.some((ep) => ep.id === id && normalizeBaseUrl(ep.baseUrl) !== normalizeBaseUrl(baseUrl))) {
+		id = `${baseId}-${suffix++}`;
+	}
+	return id;
 }
 
 async function checkEndpoint(url: string, apiKey?: string): Promise<boolean> {
@@ -90,6 +104,7 @@ function unregisterLocalProvider(pi: ExtensionAPI, endpoint: LocalEndpoint) {
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -101,11 +116,37 @@ let endpoints: LocalEndpoint[] = [];
 function loadEndpoints(): LocalEndpoint[] {
 	try {
 		const raw = fs.readFileSync(CONFIG_FILE, "utf-8");
-		endpoints = JSON.parse(raw) as LocalEndpoint[];
+		const parsed = JSON.parse(raw) as Partial<LocalEndpoint>[];
+		let changed = false;
+		endpoints = parsed
+			.filter((ep) => ep.name && ep.baseUrl)
+			.map((ep) => {
+				const normalized: LocalEndpoint = {
+					id: ep.id || generateEndpointId(ep.baseUrl!),
+					name: ep.name!,
+					baseUrl: normalizeBaseUrl(ep.baseUrl!),
+					apiKey: ep.apiKey || undefined,
+					status: ep.status === "up" || ep.status === "down" ? ep.status : "checking",
+				};
+				if (!ep.id || ep.baseUrl !== normalized.baseUrl || ep.status !== normalized.status) changed = true;
+				return normalized;
+			});
+		if (changed) saveEndpoints();
 	} catch {
 		endpoints = [];
 	}
 	return endpoints;
+}
+
+async function registerKnownEndpoints(pi: ExtensionAPI): Promise<void> {
+	for (const ep of endpoints) {
+		const models = await fetchModelsFromEndpoint(ep.baseUrl, ep.apiKey);
+		ep.status = models.length > 0 ? "up" : (await checkEndpoint(ep.baseUrl, ep.apiKey)) ? "up" : "down";
+		if (models.length > 0) {
+			registerLocalProvider(pi, ep, models.map((m) => m.id));
+		}
+	}
+	saveEndpoints();
 }
 
 function saveEndpoints() {
@@ -120,35 +161,21 @@ function saveEndpoints() {
 
 // ─── Extension ───────────────────────────────────────────────────────────────
 
-export default function (pi: ExtensionAPI) {
-	pi.on("session_start", async (_event, ctx) => {
-		// Load saved endpoints from persistent file
-		loadEndpoints();
-
-		// Register all known endpoints as providers
-		for (const ep of endpoints) {
-			// Check status and discover models
-			const isUp = await checkEndpoint(ep.baseUrl, ep.apiKey);
-			ep.status = isUp ? "up" : "down";
-			if (isUp) {
-				const models = await fetchModelsFromEndpoint(ep.baseUrl, ep.apiKey);
-				const modelIds = models.map((m) => m.id);
-				registerLocalProvider(pi, ep, modelIds);
-			}
-		}
-	});
+export default async function (pi: ExtensionAPI) {
+	// Register saved local providers during extension load, before Pi restores the
+	// default/scoped model list. Registering in session_start is too late for
+	// startup model resolution and `pi --list-models`.
+	loadEndpoints();
+	await registerKnownEndpoints(pi);
 
 	// ─── /local-models command ──────────────────────────────────────────────
 
 	pi.registerCommand("local-models", {
 		description: "Manage local LLM endpoints",
 		handler: async (_args, ctx) => {
-			// Refresh endpoint statuses
-			for (const ep of endpoints) {
-				ep.status = "checking";
-				const isUp = await checkEndpoint(ep.baseUrl, ep.apiKey);
-				ep.status = isUp ? "up" : "down";
-			}
+			// Refresh endpoint statuses and make newly-online models visible in /model.
+			for (const ep of endpoints) ep.status = "checking";
+			await registerKnownEndpoints(pi);
 
 			await showEndpointsList(pi, ctx);
 		},
@@ -256,8 +283,16 @@ async function showAddEndpoint(pi: ExtensionAPI, ctx: any): Promise<void> {
 	const name = await ctx.ui.input("Endpoint name", "e.g., My RunPod, Ollama, LM Studio");
 	if (!name) { await showEndpointsList(pi, ctx); return; }
 
-	const baseUrl = await ctx.ui.input("Base URL (with /v1)", "e.g., http://runpod-llm:8000/v1");
-	if (!baseUrl) { await showEndpointsList(pi, ctx); return; }
+	const baseUrlInput = await ctx.ui.input("Base URL (with /v1)", "e.g., http://runpod-llm:8000/v1");
+	if (!baseUrlInput) { await showEndpointsList(pi, ctx); return; }
+	const baseUrl = normalizeBaseUrl(baseUrlInput);
+
+	const existing = endpoints.find((ep) => normalizeBaseUrl(ep.baseUrl) === baseUrl);
+	if (existing) {
+		ctx.ui.notify(`${existing.name} is already onboarded as ${getProviderName(existing)}`, "info");
+		await showEndpointsList(pi, ctx);
+		return;
+	}
 
 	const useKey = await ctx.ui.confirm("API Key", "Does this endpoint require an API key?");
 	let apiKey: string | undefined;
@@ -279,7 +314,7 @@ async function showAddEndpoint(pi: ExtensionAPI, ctx: any): Promise<void> {
 	const modelIds = models.map((m) => m.id);
 
 	const endpoint: LocalEndpoint = {
-		id: generateId(),
+		id: generateUniqueEndpointId(baseUrl),
 		name,
 		baseUrl,
 		apiKey: apiKey || undefined,
@@ -326,9 +361,19 @@ async function selectModelForEndpoint(pi: ExtensionAPI, ctx: any, endpointId: st
 	const chosen = await ctx.ui.select(`Select a model on ${ep.name}:`, modelIds);
 	if (!chosen) return;
 
-	// Ensure provider is registered
+	// Ensure provider is registered, then switch the active Pi model.
 	registerLocalProvider(pi, ep, models.map((m) => m.id));
-	ctx.ui.notify(`Selected ${chosen}`, "success");
+	const model = ctx.modelRegistry.find(getProviderName(ep), chosen);
+	if (!model) {
+		ctx.ui.notify(`Model not found after registration: ${getProviderName(ep)}/${chosen}`, "error");
+		return;
+	}
+	const success = await pi.setModel(model);
+	if (!success) {
+		ctx.ui.notify(`No API key available for ${getProviderName(ep)}/${chosen}`, "error");
+		return;
+	}
+	ctx.ui.notify(`Selected ${getProviderName(ep)}/${chosen}`, "success");
 }
 
 // ─── TUI: Refresh all endpoints ──────────────────────────────────────────────
