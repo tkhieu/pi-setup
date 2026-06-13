@@ -9,8 +9,8 @@ Personal reproducible setup for [Pi coding agent](https://pi.dev): extensions, c
   - preserves Pi's native themed header and loaded skills/extensions/themes listing
 - `extensions/` — custom Pi extensions
   - themed startup welcome card
+  - `/context` usage breakdown for startup tokens, messages, and tool calls
   - custom footer
-  - context command
   - local model manager
 - `themes/` — polished custom themes
   - `nebula-pulse` *(current default)*

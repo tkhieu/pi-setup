@@ -1,146 +1,363 @@
 /**
- * Context Command Extension
+ * /context — compact context usage report.
  *
- * /context - Show detailed context usage with visual bar, breakdown, and tools.
+ * Shows startup context (system prompt, tools, context files, skills) and, once a
+ * conversation exists, message/tool-call consumers. Counts are estimates except
+ * when the active provider has reported aggregate usage via ctx.getContextUsage().
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { DynamicBorder } from "@earendil-works/pi-coding-agent";
-import { Container, Text, Spacer } from "@earendil-works/pi-tui";
+import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
-// ─── Token estimation (rough: ~4 chars per token) ───────────────────────────
+type AnyRecord = Record<string, any>;
 
-function estimateTokens(text: string): number {
-	return Math.ceil(text.length / 4);
+type Item = {
+	label: string;
+	tokens: number;
+	detail?: string;
+	kind?: string;
+};
+
+type ContextReport = {
+	model: string;
+	limit: number;
+	total: number;
+	free: number;
+	mode: "startup" | "conversation";
+	categories: Item[];
+	startup: {
+		system: Item[];
+		tools: Item[];
+		memory: Item[];
+		skills: Record<string, Item[]>;
+	};
+	conversation: {
+		entries: number;
+		byRole: Item[];
+		toolCalls: Item[];
+		largest: Item[];
+	};
+};
+
+const TOKEN_DIVISOR = 4;
+const MAX_LIST = 8;
+
+function estimateTokens(value: unknown): number {
+	if (value == null) return 0;
+	const text = typeof value === "string" ? value : JSON.stringify(value);
+	return Math.max(0, Math.ceil(text.length / TOKEN_DIVISOR));
 }
 
 function fmt(n: number): string {
-	if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
-	if (n >= 1000) return (n / 1000).toFixed(1) + "K";
-	return String(n);
+	if (n < 20 && n > 0) return "<20";
+	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}m`;
+	if (n >= 10_000) return `${Math.round(n / 1000)}k`;
+	if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+	return String(Math.round(n));
 }
 
-// ─── Extension ───────────────────────────────────────────────────────────────
+function pct(tokens: number, limit: number): string {
+	if (!limit) return "0%";
+	const p = (tokens / limit) * 100;
+	return p < 0.1 && tokens > 0 ? "<0.1%" : `${p.toFixed(1)}%`;
+}
 
-export default function (pi: ExtensionAPI) {
-	pi.registerCommand("context", {
-		description: "Show detailed context usage breakdown",
-		handler: async (_args, ctx) => {
-			const usage = ctx.getContextUsage();
-			const totalTokens = usage?.tokens ?? 0;
-			const limit = usage?.limit ?? ctx.model?.contextWindow ?? 128000;
-			const pct = limit > 0 ? (totalTokens / limit) * 100 : 0;
+function compactPath(file: string): string {
+	const home = process.env.HOME;
+	return home && file.startsWith(home) ? file.replace(home, "~") : file;
+}
 
-			// Estimate breakdown
-			const systemPrompt = ctx.getSystemPrompt() ?? "";
-			const sysPromptTokens = estimateTokens(systemPrompt);
+function firstLine(value: unknown): string {
+	const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
+	return text.replace(/\s+/g, " ").trim();
+}
 
-			const allTools = pi.getAllTools();
-			const toolTokens = allTools.reduce((sum: number, t: any) => {
-				return sum + estimateTokens(t.name + " " + (t.description ?? ""));
-			}, 0);
+function contentText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return firstLine(content);
+	const parts: string[] = [];
+	for (const block of content) {
+		if (!block || typeof block !== "object") continue;
+		if (block.type === "text" && typeof block.text === "string") parts.push(block.text);
+		else if (block.type === "thinking" && typeof block.thinking === "string") parts.push(block.thinking);
+		else if (block.type === "toolCall") parts.push(`${block.name ?? "tool"} ${JSON.stringify(block.arguments ?? {})}`);
+		else if (block.type === "image") parts.push("[image]");
+	}
+	return parts.join("\n");
+}
 
-			const branch = ctx.sessionManager.getBranch();
-			let msgTokens = 0;
-			let msgCount = 0;
-			for (const entry of branch) {
-				if (entry.type === "message") {
-					const content = JSON.stringify((entry as any).message?.content ?? "");
-					msgTokens += estimateTokens(content);
-					msgCount++;
+function messageTokens(message: AnyRecord): number {
+	if (message.role === "toolResult") {
+		return estimateTokens(`${message.toolName ?? "toolResult"}\n${contentText(message.content)}`);
+	}
+	return estimateTokens(contentText(message.content ?? message));
+}
+
+function messageRole(entry: AnyRecord): string | undefined {
+	return entry?.message?.role;
+}
+
+function selectedToolNames(options: AnyRecord, pi: ExtensionAPI): Set<string> {
+	const selected = Array.isArray(options.selectedTools) ? options.selectedTools : [];
+	if (selected.length === 0) return new Set(pi.getActiveTools().map((t: any) => typeof t === "string" ? t : t.name));
+	return new Set(selected.map((t: any) => typeof t === "string" ? t : t.name).filter(Boolean));
+}
+
+function subtractKnown(systemPrompt: string, known: string[]): number {
+	let remaining = systemPrompt;
+	for (const part of known.filter(Boolean).sort((a, b) => b.length - a.length)) {
+		remaining = remaining.replace(part, "");
+	}
+	return estimateTokens(remaining);
+}
+
+function pushCount(map: Map<string, number>, key: string, tokens: number) {
+	map.set(key, (map.get(key) ?? 0) + tokens);
+}
+
+function topItems(items: Item[], max = MAX_LIST): Item[] {
+	return [...items].sort((a, b) => b.tokens - a.tokens || a.label.localeCompare(b.label)).slice(0, max);
+}
+
+function buildReport(pi: ExtensionAPI, ctx: any): ContextReport {
+	const options = ctx.getSystemPromptOptions?.() ?? {};
+	const usage = ctx.getContextUsage?.();
+	const limit = usage?.limit ?? ctx.model?.contextWindow ?? 128_000;
+	const model = ctx.model?.id ?? "unknown model";
+	const systemPrompt = ctx.getSystemPrompt?.() ?? "";
+
+	const skills = Array.isArray(options.skills) ? options.skills : [];
+	const skillItems: Item[] = skills.map((skill: AnyRecord) => ({
+		label: skill.name ?? "unknown",
+		tokens: estimateTokens(`${skill.name ?? ""}\n${skill.description ?? ""}`),
+		detail: compactPath(skill.filePath ?? skill.sourceInfo?.path ?? ""),
+		kind: skill.sourceInfo?.scope ?? "skills",
+	}));
+	const skillsByScope: Record<string, Item[]> = {};
+	for (const item of skillItems) {
+		const scope = item.kind ?? "skills";
+		(skillsByScope[scope] ??= []).push(item);
+	}
+
+	const contextFiles = Array.isArray(options.contextFiles) ? options.contextFiles : [];
+	const memoryItems: Item[] = contextFiles.map((file: AnyRecord) => ({
+		label: compactPath(file.path ?? file.filePath ?? "context file"),
+		tokens: estimateTokens(file.content ?? file.text ?? ""),
+	}));
+
+	const selected = selectedToolNames(options, pi);
+	const allTools = pi.getAllTools();
+	const toolItems: Item[] = allTools
+		.filter((tool: AnyRecord) => selected.size === 0 || selected.has(tool.name))
+		.map((tool: AnyRecord) => ({
+			label: tool.name,
+			tokens: estimateTokens({
+				name: tool.name,
+				description: tool.description,
+				parameters: tool.parameters,
+				promptGuidelines: tool.promptGuidelines,
+			}),
+			detail: tool.sourceInfo?.source ?? "tool",
+		}));
+
+	const knownPromptParts = [
+		...skills.map((s: AnyRecord) => `${s.name ?? ""}\n${s.description ?? ""}`),
+		...skills.map((s: AnyRecord) => s.description ?? ""),
+		...contextFiles.map((f: AnyRecord) => f.content ?? f.text ?? ""),
+		...(Array.isArray(options.promptGuidelines) ? options.promptGuidelines : []),
+		options.customPrompt,
+		options.appendSystemPrompt,
+	].filter((v): v is string => typeof v === "string" && v.length > 0);
+
+	const promptGuidelinesTokens = estimateTokens(Array.isArray(options.promptGuidelines) ? options.promptGuidelines.join("\n") : "");
+	const customPromptTokens = estimateTokens([options.customPrompt, options.appendSystemPrompt].filter(Boolean).join("\n"));
+	const systemBaseTokens = Math.max(estimateTokens(systemPrompt) ? 1 : 0, subtractKnown(systemPrompt, knownPromptParts));
+	const systemItems = [
+		{ label: "Pi system prompt", tokens: systemBaseTokens },
+		{ label: "Prompt guidelines", tokens: promptGuidelinesTokens },
+		{ label: "Custom/append prompt", tokens: customPromptTokens },
+	].filter((item) => item.tokens > 0);
+
+	const branch = ctx.sessionManager.getBranch?.() ?? [];
+	const roleTokens = new Map<string, number>();
+	const toolCallTokens = new Map<string, number>();
+	const largest: Item[] = [];
+	let messageEntries = 0;
+	let conversationTokens = 0;
+
+	for (const entry of branch) {
+		if (entry.type !== "message") continue;
+		messageEntries++;
+		const role = messageRole(entry) ?? "message";
+		const message = entry.message ?? {};
+		const tokens = messageTokens(message);
+		conversationTokens += tokens;
+		pushCount(roleTokens, role, tokens);
+
+		if (role === "assistant" && Array.isArray(message.content)) {
+			for (const block of message.content) {
+				if (block?.type === "toolCall" && block.name) {
+					pushCount(toolCallTokens, block.name, estimateTokens(block.arguments ?? {}) + estimateTokens(block.name));
 				}
 			}
+		}
+		if (role === "toolResult" && message.toolName) {
+			pushCount(toolCallTokens, `${message.toolName} result`, tokens);
+		}
 
-			const accounted = sysPromptTokens + toolTokens + msgTokens;
-			const miscTokens = Math.max(0, totalTokens - accounted);
-			const freeTokens = Math.max(0, limit - totalTokens);
+		largest.push({
+			label: `${role}${entry.id ? ` ${entry.id}` : ""}`,
+			tokens,
+			detail: firstLine(contentText(message.content)).slice(0, 80),
+		});
+	}
 
-			const activeTools = pi.getActiveTools();
+	const startupSystem = systemItems.reduce((sum, item) => sum + item.tokens, 0);
+	const startupTools = toolItems.reduce((sum, item) => sum + item.tokens, 0);
+	const startupMemory = memoryItems.reduce((sum, item) => sum + item.tokens, 0);
+	const startupSkills = skillItems.reduce((sum, item) => sum + item.tokens, 0);
+	const startupTokens = startupSystem + startupTools + startupMemory + startupSkills;
+	const measuredTotal = usage?.tokens ?? 0;
+	const total = Math.max(measuredTotal, startupTokens + conversationTokens);
+	const accounted = startupTokens + conversationTokens;
+	const other = Math.max(0, total - accounted);
+	const free = Math.max(0, limit - total);
 
-			// Render as TUI overlay
-			await ctx.ui.custom<void | null>(
-				(tui, theme, _kb, done) => {
-					const container = new Container();
+	const categories = [
+		{ label: "System prompt", tokens: startupSystem },
+		{ label: "System tools", tokens: startupTools, detail: `${toolItems.length} active` },
+		{ label: "Memory files", tokens: startupMemory, detail: `${memoryItems.length} files` },
+		{ label: "Skills", tokens: startupSkills, detail: `${skillItems.length} loaded` },
+		{ label: "Messages", tokens: conversationTokens, detail: `${messageEntries} entries` },
+		{ label: "Provider/other", tokens: other },
+		{ label: "Free space", tokens: free },
+	];
 
-					// ── Top border ──
-					container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+	return {
+		model,
+		limit,
+		total,
+		free,
+		mode: messageEntries === 0 ? "startup" : "conversation",
+		categories,
+		startup: {
+			system: systemItems,
+			tools: topItems(toolItems),
+			memory: topItems(memoryItems),
+			skills: Object.fromEntries(Object.entries(skillsByScope).map(([scope, items]) => [scope, topItems(items)])),
+		},
+		conversation: {
+			entries: messageEntries,
+			byRole: [...roleTokens.entries()].map(([label, tokens]) => ({ label, tokens })).sort((a, b) => b.tokens - a.tokens),
+			toolCalls: [...toolCallTokens.entries()].map(([label, tokens]) => ({ label, tokens })).sort((a, b) => b.tokens - a.tokens).slice(0, MAX_LIST),
+			largest: topItems(largest, 10),
+		},
+	};
+}
 
-					// ── Title bar with usage ──
-					const barWidth = 20;
-					const filled = Math.round((pct / 100) * barWidth);
-					const barStr = "█".repeat(filled) + "░".repeat(barWidth - filled);
-					const barColor = pct > 80 ? theme.fg("error", barStr) : pct > 50 ? theme.fg("warning", barStr) : theme.fg("success", barStr);
-					const pctStr = pct > 80 ? theme.fg("error", `${pct.toFixed(1)}%`) : pct > 50 ? theme.fg("warning", `${pct.toFixed(1)}%`) : theme.fg("success", `${pct.toFixed(1)}%`);
+function plainReport(report: ContextReport): string {
+	const lines: string[] = [];
+	lines.push(`Context Usage — ${report.model}`);
+	lines.push(`${fmt(report.total)}/${fmt(report.limit)} tokens (${pct(report.total, report.limit)}) · free ${fmt(report.free)}`);
+	lines.push("");
+	lines.push("Breakdown");
+	for (const item of report.categories) lines.push(`  ${item.label}: ${fmt(item.tokens)} (${pct(item.tokens, report.limit)})${item.detail ? ` · ${item.detail}` : ""}`);
+	lines.push("");
+	lines.push("Startup context");
+	for (const item of report.startup.system) lines.push(`  ${item.label}: ${fmt(item.tokens)}`);
+	for (const item of report.startup.tools) lines.push(`  tool ${item.label}: ${fmt(item.tokens)}`);
+	for (const item of report.startup.memory) lines.push(`  memory ${item.label}: ${fmt(item.tokens)}`);
+	for (const [scope, items] of Object.entries(report.startup.skills)) {
+		lines.push(`  skills ${scope}`);
+		for (const item of items) lines.push(`    ${item.label}: ${fmt(item.tokens)}`);
+	}
+	if (report.mode === "conversation") {
+		lines.push("");
+		lines.push("Conversation");
+		for (const item of report.conversation.byRole) lines.push(`  ${item.label}: ${fmt(item.tokens)}`);
+		if (report.conversation.toolCalls.length) lines.push("  Tool calls/results");
+		for (const item of report.conversation.toolCalls) lines.push(`    ${item.label}: ${fmt(item.tokens)}`);
+		lines.push("  Largest entries");
+		for (const item of report.conversation.largest) lines.push(`    ${item.label}: ${fmt(item.tokens)} · ${item.detail ?? ""}`);
+	}
+	return lines.join("\n");
+}
 
-					container.addChild(new Text(
-						` ${theme.fg("accent", theme.bold("Context"))} ${barColor} ${pctStr} ${theme.fg("dim", fmt(totalTokens) + "/" + fmt(limit))}`,
-						1, 0
-					));
-					container.addChild(new Text(
-						` ${theme.fg("dim", "Model:")} ${theme.fg("accent", ctx.model?.id || "unknown")}  ${theme.fg("dim", msgCount + " msgs · " + fmt(msgTokens))}`,
-						1, 0
-					));
-					container.addChild(new Spacer(1));
+function renderReport(report: ContextReport, theme: any, width: number): string[] {
+	const barWidth = Math.max(12, Math.min(28, Math.floor(width / 4)));
+	const usedCells = Math.max(0, Math.min(barWidth, Math.round((report.total / report.limit) * barWidth)));
+	const bar = `${"█".repeat(usedCells)}${"░".repeat(barWidth - usedCells)}`;
+	const lines: string[] = [];
+	const add = (line = "") => lines.push(line);
+	const item = (prefix: string, row: Item) => {
+		const amount = `${fmt(row.tokens)} (${pct(row.tokens, report.limit)})`;
+		add(`${theme.fg("dim", prefix)} ${theme.fg("text", row.label)} ${theme.fg("dim", "·")} ${theme.fg("accent", amount)}${row.detail ? ` ${theme.fg("dim", "· " + row.detail)}` : ""}`);
+	};
 
-					// ── Breakdown (compact table) ──
-					const allBreakdown: [string, number, string][] = [
-						["System", sysPromptTokens, "accent"],
-						["Tools", toolTokens, "mdLink"],
-						["Messages", msgTokens, "accent"],
-						["Other", miscTokens, "dim"],
-						["Free", freeTokens, "success"],
-					];
+	add(`${theme.fg("accent", theme.bold("Context Usage"))} ${theme.fg("dim", "·")} ${theme.fg("text", report.model)}`);
+	add(`${theme.fg(report.total / report.limit > 0.8 ? "error" : report.total / report.limit > 0.5 ? "warning" : "success", bar)} ${theme.fg("text", `${fmt(report.total)}/${fmt(report.limit)}`)} ${theme.fg("dim", `(${pct(report.total, report.limit)}) · free ${fmt(report.free)}`)}`);
+	add("");
+	add(theme.fg("dim", "Estimated usage by category"));
+	for (const row of report.categories) item("├", row);
+	add("");
+	add(`${theme.fg("accent", "Startup context")} ${theme.fg("dim", report.mode === "startup" ? "before first message" : "base payload")}`);
+	for (const row of report.startup.system) item("├", row);
+	if (report.startup.memory.length) {
+		add(theme.fg("dim", "├ Memory files"));
+		for (const row of report.startup.memory) item("│ ├", row);
+	}
+	if (report.startup.tools.length) {
+		add(theme.fg("dim", `├ System tools · top ${report.startup.tools.length}`));
+		for (const row of report.startup.tools) item("│ ├", row);
+	}
+	for (const [scope, rows] of Object.entries(report.startup.skills)) {
+		add(theme.fg("dim", `├ Skills · ${scope}`));
+		for (const row of rows) item("│ ├", row);
+	}
+	if (report.mode === "conversation") {
+		add("");
+		add(`${theme.fg("accent", "Conversation")} ${theme.fg("dim", `${report.conversation.entries} entries`)}`);
+		for (const row of report.conversation.byRole) item("├", row);
+		if (report.conversation.toolCalls.length) {
+			add(theme.fg("dim", "├ Tool calls/results"));
+			for (const row of report.conversation.toolCalls) item("│ ├", row);
+		}
+		if (report.conversation.largest.length) {
+			add(theme.fg("dim", "├ Largest message entries"));
+			for (const row of report.conversation.largest) item("│ ├", row);
+		}
+	}
 
-					const maxL = Math.max(...allBreakdown.filter(([_, t]) => t > 0).map(([l]) => l.length));
-					for (const [label, tokens, color] of allBreakdown) {
-						if (tokens === 0) continue;
-						const itemPct = limit > 0 ? ((tokens / limit) * 100) : 0;
-						// Show a small 5-char bar proportional to this item's share of limit
-						const shortBar = Math.round((itemPct / 100) * 5);
-						const bar = shortBar > 0 ? "█".repeat(shortBar) + "░".repeat(5 - shortBar) : "▏░░░░";
-						const coloredBar = theme.fg(color as any, bar);
-						const padded = label.padEnd(maxL);
-						container.addChild(new Text(
-							` ${coloredBar} ${theme.fg("dim", padded)} ${theme.fg("text", fmt(tokens).padStart(6))} ${theme.fg("dim", itemPct.toFixed(1) + "%")}`,
-							1, 0
-						));
-					}
+	return lines.map((line) => visibleWidth(line) > width ? truncateToWidth(line, width) : line);
+}
 
-					container.addChild(new Spacer(1));
+export default function (pi: ExtensionAPI) {
+	pi.registerMessageRenderer("context-usage", (message, _state, theme) => {
+		const report = message.details as ContextReport;
+		return {
+			render(width: number): string[] {
+				const box = new Box(1, 1, (s) => theme.bg("customMessageBg", s));
+				box.addChild(new Text(renderReport(report, theme, Math.max(20, width - 2)).join("\n"), 0, 0));
+				return box.render(width);
+			},
+			invalidate() {},
+		};
+	});
 
-					// ── Tools (compact single line) ──
-					if (allTools.length > 0) {
-						const names = allTools.map((t: any) => t.name);
-						const activeNames = new Set(
-							activeTools.map((t: any) => typeof t === "string" ? t : t.name)
-						);
-						// Highlight active tools, dim inactive
-						const parts = names.map((n: string) =>
-							activeNames.has(n)
-								? theme.fg("text", n)
-								: theme.fg("dim", n)
-						);
-						container.addChild(new Text(
-							` ${theme.fg("dim", "Tools:")} ${parts.join(theme.fg("dim", " · "))}`,
-							1, 0
-						));
-						container.addChild(new Spacer(1));
-					}
-
-					// ── Footer ──
-					container.addChild(new Text(` ${theme.fg("dim", "Any key to close")}`, 1, 0));
-
-					// ── Bottom border ──
-					container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-
-					return {
-						render: (w) => container.render(w),
-						invalidate: () => container.invalidate(),
-						handleInput: () => done(null),
-					};
-				},
-				{ overlay: true },
-			);
+	pi.registerCommand("context", {
+		description: "Show what is consuming the context window",
+		handler: async (_args, ctx) => {
+			const report = buildReport(pi, ctx);
+			if (ctx.mode === "print" || !ctx.hasUI) {
+				console.log(plainReport(report));
+				return;
+			}
+			pi.sendMessage({
+				customType: "context-usage",
+				content: "context usage",
+				display: true,
+				details: report,
+			});
 		},
 	});
 }
