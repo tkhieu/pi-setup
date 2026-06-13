@@ -37,7 +37,19 @@ function projectName(cwd: string): string {
 }
 
 export default function (pi: ExtensionAPI) {
+	let showWelcome = false;
+
 	pi.registerMessageRenderer("pi-welcome", (message, _state, theme) => {
+		// The welcome card is a persisted custom message so it can scroll away like
+		// normal chat. Hide persisted copies when resuming, forking, reloading, or
+		// navigating branches; it should only be visible during a brand-new session.
+		if (!showWelcome) {
+			return {
+				render: () => [],
+				invalidate: () => {},
+			};
+		}
+
 		const details = (message.details ?? {}) as Partial<WelcomeDetails>;
 		const model = details.model ?? "no model";
 		const user = details.user ?? process.env.USER ?? "user";
@@ -62,11 +74,16 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", (event, ctx) => {
 		if (!ctx.hasUI) return;
 
 		// Ensure any older fixed header from a previous version is removed.
 		ctx.ui.setHeader(undefined);
+
+		const isBrandNewSession = (event.reason === "startup" || event.reason === "new")
+			&& ctx.sessionManager.getBranch().length === 0;
+		showWelcome = isBrandNewSession;
+		if (!isBrandNewSession) return;
 
 		pi.sendMessage({
 			customType: "pi-welcome",
@@ -80,7 +97,12 @@ export default function (pi: ExtensionAPI) {
 		});
 	});
 
+	pi.on("session_tree", () => {
+		showWelcome = false;
+	});
+
 	pi.on("session_shutdown", (_event, ctx) => {
+		showWelcome = false;
 		if (ctx.hasUI) ctx.ui.setHeader(undefined);
 	});
 }
