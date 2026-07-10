@@ -30,7 +30,8 @@
     "npm:@dustydonkey/pi-spinner",
     "npm:@ayulab/pi-rewind",
     "npm:@juicesharp/rpiv-btw",
-    "npm:@ff-labs/pi-fff"
+    "npm:@ff-labs/pi-fff",
+    "npm:@hypabolic/pi-hypa"
   ],
   "defaultThinkingLevel": "high",
   "hideThinkingBlock": true,
