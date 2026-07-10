@@ -32,11 +32,17 @@
     "npm:@juicesharp/rpiv-btw",
     "npm:@ff-labs/pi-fff",
     "npm:@hypabolic/pi-hypa",
-    "npm:@tintinweb/pi-subagents"
+    "npm:@tintinweb/pi-subagents",
+    "npm:pi-subagents",
+    "npm:bigpowers",
+    "npm:@gotgenes/pi-permission-system",
+    "npm:@quintinshaw/pi-dynamic-workflows",
+    "npm:pi-agent-browser-native"
   ],
   "defaultThinkingLevel": "high",
   "hideThinkingBlock": true,
   "skills": [
     "+skills/find-skills/SKILL.md"
-  ]
+  ],
+  "showHardwareCursor": true
 }
