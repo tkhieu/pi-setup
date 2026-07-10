@@ -31,7 +31,8 @@
     "npm:@ayulab/pi-rewind",
     "npm:@juicesharp/rpiv-btw",
     "npm:@ff-labs/pi-fff",
-    "npm:@hypabolic/pi-hypa"
+    "npm:@hypabolic/pi-hypa",
+    "npm:@tintinweb/pi-subagents"
   ],
   "defaultThinkingLevel": "high",
   "hideThinkingBlock": true,
